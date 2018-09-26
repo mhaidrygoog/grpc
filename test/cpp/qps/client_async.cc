@@ -1014,9 +1014,7 @@ class CallbackClient
     num_threads_ =
         config.outstanding_rpcs_per_channel() * config.client_channels();
     SetupLoadTest(config, num_threads_);
-    threads_done_ = num_threads_;
-    if (closed_loop_)
-      gpr_log(GPR_ERROR,"Closed loop\n");
+    threads_done_ = 0;
   }
 
   virtual ~CallbackClient() {}
@@ -1032,26 +1030,26 @@ class CallbackClient
       return;
     }
 
-    gpr_timespec next_issue_time = gpr_now(GPR_CLOCK_REALTIME);
-    if (!closed_loop_)
-      next_issue_time = NextIssueTime(thread_idx);
-    // Start an alarm call back to run the internal callback after
-    // next_issue_time
-    Alarm *alarm = new Alarm();
-    alarm->experimental().Set(next_issue_time,
-                               [this, t, thread_idx, alarm](bool ok) {
-                                 ThreadFuncImpl(t, thread_idx);
-                                 delete alarm;
-                                 });
-
-    //ThreadFuncImpl(t, thread_idx);
+    if (!closed_loop_) {
+      gpr_timespec next_issue_time = NextIssueTime(thread_idx);
+      // Start an alarm call back to run the internal callback after
+      // next_issue_time
+      Alarm *alarm = new Alarm();
+      alarm->experimental().Set(next_issue_time,
+                                [this, t, thread_idx, alarm](bool ok) {
+                                  delete alarm;
+                                  ThreadFuncImpl(t, thread_idx);
+                                  });
+    } else {
+      ThreadFuncImpl(t, thread_idx);
+    }
   }
 
  protected:
   size_t num_threads_;
   std::mutex mu_;
   std::condition_variable cv_;
-  int threads_done_;
+  size_t threads_done_;
 };
 
 class CallbackUnaryClient final : public CallbackClient {
@@ -1060,37 +1058,17 @@ class CallbackUnaryClient final : public CallbackClient {
       : CallbackClient(config) {
     StartThreads(num_threads_);
   }
-  ~CallbackUnaryClient() {
-    std::unique_lock<std::mutex> l(mu_);
-    while(threads_done_ != num_threads_)
-      cv_.wait(l);
-    gpr_log(GPR_ERROR,"Callback destroyed\n");
-  }
-
-  bool InitThreadFuncImpl(size_t thread_idx) override { return true; }
+  ~CallbackUnaryClient() {}
 
   bool ThreadFuncImpl(Thread *t, size_t thread_idx) override {
-    gpr_log(GPR_ERROR,"ThreadFuncImpl called\n");
     auto* stub = channels_[thread_idx % channels_.size()].get_stub();
-    GPR_TIMER_SCOPE("CallbackUnaryClient::ThreadFunc", 0);
     ClientContext* context = new grpc::ClientContext();
     SimpleResponse *response = new SimpleResponse();
+    GPR_TIMER_SCOPE("CallbackUnaryClient::ThreadFunc", 0);
     double start = UsageTimer::Now();
     stub->experimental_async()->UnaryCall(
         context, &request_, response,
                        [this, t, thread_idx, start, context, response](grpc::Status s) {
-                         if (ThreadCompleted()) {
-                           delete context;
-                           delete response;
-                           std::unique_lock<std::mutex> l(mu_);
-                           l.lock();
-                           threads_done_++;
-                           if (threads_done_ == num_threads_)
-                            cv_.notify_one();
-                           else
-                            l.unlock();
-                           return;
-                         }
                          // Update Histogram with data from the callback run
                          HistogramEntry entry;
                          if (s.ok()) {
@@ -1099,10 +1077,20 @@ class CallbackUnaryClient final : public CallbackClient {
                          entry.set_status(s.error_code());
                          t->UpdateHistogram(&entry);
 
-                         gpr_log(GPR_ERROR,"Callback called\n");
-                         // Start a new Unary call
+                         // Clean up after this callback and check for
+                         // termination
                          delete context;
                          delete response;
+                         if (ThreadCompleted()) {
+                           std::lock_guard<std::mutex> l(mu_);
+                           threads_done_++;
+                           if (threads_done_ == num_threads_) {
+                            cv_.notify_one();
+                           }
+                           return;
+                         }
+
+                         // Start a new Unary call
                          ThreadFunc(thread_idx, t);
                        });
     return true;
@@ -1110,6 +1098,10 @@ class CallbackUnaryClient final : public CallbackClient {
 
  private:
   void DestroyMultithreading() override final {
+    std::unique_lock<std::mutex> l(mu_);
+    while(threads_done_ != num_threads_) {
+      cv_.wait(l);
+    }
     EndThreads();
   }
 };
