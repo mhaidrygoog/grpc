@@ -136,8 +136,9 @@ class GrpcLb : public LoadBalancingPolicy {
   void HandOffPendingPicksLocked(LoadBalancingPolicy* new_policy) override;
   void ExitIdleLocked() override;
   void ResetBackoffLocked() override;
-  void FillChildRefsForChannelz(ChildRefsList* child_subchannels,
-                                ChildRefsList* child_channels) override;
+  void FillChildRefsForChannelz(
+      channelz::ChildRefsList* child_subchannels,
+      channelz::ChildRefsList* child_channels) override;
 
  private:
   /// Linked list of pending pick requests. It stores all information needed to
@@ -852,10 +853,12 @@ void GrpcLb::BalancerCallState::OnBalancerMessageReceivedLocked(
     }
   } else {
     // No valid initial response or serverlist found.
+    char* response_slice_str =
+        grpc_dump_slice(response_slice, GPR_DUMP_ASCII | GPR_DUMP_HEX);
     gpr_log(GPR_ERROR,
             "[grpclb %p] Invalid LB response received: '%s'. Ignoring.",
-            grpclb_policy,
-            grpc_dump_slice(response_slice, GPR_DUMP_ASCII | GPR_DUMP_HEX));
+            grpclb_policy, response_slice_str);
+    gpr_free(response_slice_str);
   }
   grpc_slice_unref_internal(response_slice);
   if (!grpclb_policy->shutting_down_) {
@@ -1256,8 +1259,9 @@ bool GrpcLb::PickLocked(PickState* pick, grpc_error** error) {
   return pick_done;
 }
 
-void GrpcLb::FillChildRefsForChannelz(ChildRefsList* child_subchannels,
-                                      ChildRefsList* child_channels) {
+void GrpcLb::FillChildRefsForChannelz(
+    channelz::ChildRefsList* child_subchannels,
+    channelz::ChildRefsList* child_channels) {
   // delegate to the RoundRobin to fill the children subchannels.
   rr_policy_->FillChildRefsForChannelz(child_subchannels, child_channels);
   MutexLock lock(&lb_channel_mu_);
